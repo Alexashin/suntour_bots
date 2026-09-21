@@ -1,99 +1,327 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from html import escape
 from typing import Any
-
-STEPS = (
-    "destination",
-    "dates",
-    "travelers",
-    "nights",
-    "name",
-    "contact_method",
-    "phone",
-)
-
-PROMPTS = {
-    "destination": "Куда хотите поехать? 🌎",
-    "dates": "Какие даты поездки? 📅",
-    "travelers": "Сколько человек? Если есть дети — укажите их возраст 👶",
-    "nights": "На сколько ночей планируете поездку? ☀️",
-    "name": "Как к вам обращаться?",
-    "contact_method": "Как удобнее продолжить общение?",
-    "phone": "Оставьте номер телефона, пожалуйста 📞",
-}
 
 CONTACT_CHAT = "chat"
 CONTACT_PHONE = "phone"
+
+MAIN_ACTION_START = "🧳 Подобрать тур"
+MAIN_ACTION_SUBSCRIBE = "🔥 Подписаться на рассылку"
+MAIN_ACTION_UNSUBSCRIBE = "🔕 Отписаться от рассылки"
+MAIN_ACTION_CONTACTS = "ℹ️ Контакты"
+
+STEP_ORDER = (
+    "departure_city",
+    "destination",
+    "adults",
+    "children_count",
+    "children_ages",
+    "hotel_category",
+    "meal_plan",
+    "nights",
+    "dates",
+    "name",
+    "contact_method",
+    "phone",
+    "review",
+)
+
+STEP_TITLES = {
+    "departure_city": "Город вылета",
+    "destination": "Направление",
+    "adults": "Взрослые",
+    "children_count": "Дети",
+    "children_ages": "Возраст детей",
+    "hotel_category": "Отель",
+    "meal_plan": "Питание",
+    "nights": "Ночи",
+    "dates": "Даты",
+    "name": "Имя",
+    "contact_method": "Связь",
+    "phone": "Телефон",
+    "review": "Проверка заявки",
+}
+
+PROMPTS = {
+    "departure_city": "Откуда планируете вылет? ✈️\nВыберите вариант или напишите свой город.",
+    "destination": "Куда хотите поехать? 🌍\nМожно выбрать популярное направление или написать своё.",
+    "adults": "Сколько взрослых едет? 👤",
+    "children_count": "Сколько детей едет с вами? 👶",
+    "children_ages": "Укажите возраст детей через запятую.\nНапример: 5, 9",
+    "hotel_category": "Какая минимальная категория отеля подходит? 🏨",
+    "meal_plan": "Какое питание рассматриваете? 🍽",
+    "nights": "На сколько ночей планируете поездку? 🌙\nМожно выбрать диапазон или написать своё значение.",
+    "dates": "Когда хотите поехать? 📅\nНапишите точные или примерные даты либо выберите вариант.",
+    "name": "Как к вам обращаться? 🙂",
+    "contact_method": "Как удобнее продолжить общение?",
+    "phone": "Оставьте номер телефона 📞\nМожно отправить его кнопкой или ввести вручную.",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Choice:
+    text: str
+    code: str
+    value: str
 
 
 @dataclass(slots=True)
 class ScenarioResult:
     reply: str
-    next_step: str | None
+    next_step: str
     data: dict[str, Any]
-    completed: bool = False
+    validation_error: bool = False
+
+
+def clean_data(data: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
 def start_scenario() -> ScenarioResult:
-    return ScenarioResult(
-        reply="Здравствуйте! Поможем подобрать тур 😊\n\n" + PROMPTS["destination"],
-        next_step="destination",
-        data={},
+    data: dict[str, Any] = {"_history": []}
+    return ScenarioResult(render_step("departure_city", data), "departure_city", data)
+
+
+def _progress(step: str) -> str:
+    visible = [s for s in STEP_ORDER if s not in {"children_ages", "phone", "review"}]
+    if step in visible:
+        idx = visible.index(step) + 1
+        return f"Шаг {idx} из {len(visible)}"
+    if step == "children_ages":
+        return "Уточняем состав туристов"
+    if step == "phone":
+        return "Контакт для связи"
+    return "Проверка заявки"
+
+
+def render_step(step: str, data: dict[str, Any]) -> str:
+    if step == "review":
+        return render_review(data)
+    title = STEP_TITLES.get(step, "Подбор тура")
+    prompt = PROMPTS.get(step, "Введите значение")
+    return f"🧳 Подбор тура · {_progress(step)}\n\n<b>{title}</b>\n{prompt}"
+
+
+def choice_rows(step: str, data: dict[str, Any], *, display_name: str | None = None) -> list[list[Choice]]:
+    if step == "departure_city":
+        # Воронеж не предлагаем: используем только актуальные рабочие аэропорты.
+        # Москва — основной вариант для клиентов агентства, Санкт-Петербург — крупная альтернатива.
+        return [
+            [Choice("Москва", "msk", "Москва"), Choice("Санкт-Петербург", "spb", "Санкт-Петербург")],
+            [Choice("Калуга", "kgd", "Калуга"), Choice("Тамбов", "tbw", "Тамбов")],
+            [Choice("Ярославль", "yar", "Ярославль")],
+            [Choice("Другой город", "manual", ""), Choice("Без перелёта", "no_flight", "Без перелёта")],
+        ]
+    if step == "destination":
+        return [
+            [Choice("🇹🇷 Турция", "tr", "Турция"), Choice("🇪🇬 Египет", "eg", "Египет")],
+            [Choice("🇹🇭 Таиланд", "th", "Таиланд"), Choice("🇻🇳 Вьетнам", "vn", "Вьетнам")],
+            [Choice("🇨🇳 Китай", "cn", "Китай"), Choice("🇷🇺 Россия", "ru", "Россия")],
+            [Choice("Другое направление", "manual", "")],
+        ]
+    if step == "adults":
+        return [[Choice(str(n), str(n), str(n)) for n in (1, 2, 3, 4)], [Choice("5+", "5plus", "5+")]]
+    if step == "children_count":
+        return [[Choice("Без детей", "0", "0"), Choice("1 ребёнок", "1", "1")], [Choice("2 ребёнка", "2", "2"), Choice("3+ детей", "3plus", "3+")]]
+    if step == "hotel_category":
+        return [
+            [Choice("⭐⭐⭐ и выше", "3", "3★ и выше"), Choice("⭐⭐⭐⭐ и выше", "4", "4★ и выше")],
+            [Choice("⭐⭐⭐⭐⭐", "5", "5★"), Choice("Не важно", "any", "Не важно")],
+        ]
+    if step == "meal_plan":
+        return [
+            [Choice("Любое", "any", "Любое"), Choice("Всё включено", "ai", "Всё включено")],
+            [Choice("Завтрак", "bb", "Завтрак"), Choice("Завтрак + ужин", "hb", "Завтрак + ужин")],
+            [Choice("3-разовое", "fb", "Завтрак, обед, ужин")],
+        ]
+    if step == "nights":
+        return [
+            [Choice("6–8", "6_8", "6–8"), Choice("9–11", "9_11", "9–11"), Choice("12–14", "12_14", "12–14")],
+            [Choice("Не важно", "any", "Не важно")],
+        ]
+    if step == "dates":
+        return [
+            [Choice("В ближайшие 2 недели", "2w", "В ближайшие 2 недели")],
+            [Choice("В течение месяца", "1m", "В течение месяца"), Choice("Даты не определены", "unknown", "Даты не определены")],
+        ]
+    if step == "name" and display_name:
+        return [[Choice(f"Оставить «{display_name}»", "profile", display_name)]]
+    if step == "contact_method":
+        return [[Choice("💬 В чате", "chat", CONTACT_CHAT), Choice("📞 По телефону", "phone", CONTACT_PHONE)]]
+    return []
+
+
+def resolve_choice(step: str, code: str, data: dict[str, Any], *, display_name: str | None = None) -> str | None:
+    for row in choice_rows(step, data, display_name=display_name):
+        for choice in row:
+            if choice.code == code:
+                return choice.value
+    return None
+
+
+def _is_zero_children(value: str) -> bool:
+    lowered = value.strip().casefold()
+    return lowered in {"0", "без детей", "нет", "не будет"}
+
+
+def _display_contact_method(value: Any) -> str:
+    if value == CONTACT_CHAT:
+        return "в чате"
+    if value == CONTACT_PHONE:
+        return "по телефону"
+    return str(value or "—")
+
+
+def render_review(data: dict[str, Any]) -> str:
+    d = clean_data(data)
+    def e(value: Any) -> str:
+        return escape(str(value if value not in (None, '') else '—'))
+    children = str(d.get("children_count", "—"))
+    ages = d.get("children_ages")
+    if ages and not _is_zero_children(children):
+        children = f"{children} (возраст: {ages})"
+
+    phone = d.get("phone")
+    contact = _display_contact_method(d.get("contact_method"))
+    if phone:
+        contact += f" · {phone}"
+
+    return (
+        "✅ <b>Проверьте заявку</b>\n\n"
+        f"✈️ Город вылета: <b>{e(d.get('departure_city'))}</b>\n"
+        f"🌍 Направление: <b>{e(d.get('destination'))}</b>\n"
+        f"👤 Взрослых: <b>{e(d.get('adults'))}</b>\n"
+        f"👶 Дети: <b>{e(children)}</b>\n"
+        f"🏨 Отель: <b>{e(d.get('hotel_category'))}</b>\n"
+        f"🍽 Питание: <b>{e(d.get('meal_plan'))}</b>\n"
+        f"🌙 Ночей: <b>{e(d.get('nights'))}</b>\n"
+        f"📅 Даты: <b>{e(d.get('travel_dates'))}</b>\n"
+        f"🙂 Имя: <b>{e(d.get('client_name'))}</b>\n"
+        f"☎️ Связь: <b>{e(contact)}</b>\n\n"
+        "Если всё верно — отправьте заявку. Если нет — измените нужный параметр."
     )
 
 
-def consume(step: str, text: str, data: dict[str, Any]) -> ScenarioResult:
-    value = text.strip()
+def review_edit_rows() -> list[list[Choice]]:
+    return [
+        [Choice("✈️ Вылет", "departure_city", "departure_city"), Choice("🌍 Направление", "destination", "destination")],
+        [Choice("👤 Взрослые", "adults", "adults"), Choice("👶 Дети", "children_count", "children_count")],
+        [Choice("🏨 Отель", "hotel_category", "hotel_category"), Choice("🍽 Питание", "meal_plan", "meal_plan")],
+        [Choice("🌙 Ночи", "nights", "nights"), Choice("📅 Даты", "dates", "dates")],
+        [Choice("🙂 Имя", "name", "name"), Choice("☎️ Связь", "contact_method", "contact_method")],
+    ]
+
+
+def edit_step(data: dict[str, Any], step: str) -> ScenarioResult:
+    if step not in STEP_ORDER or step == "review":
+        return ScenarioResult(render_review(data), "review", data, validation_error=True)
+    new_data = dict(data)
+    new_data["_editing"] = True
+    return ScenarioResult(render_step(step, new_data), step, new_data)
+
+
+def go_back(step: str, data: dict[str, Any]) -> ScenarioResult:
+    new_data = dict(data)
+    if new_data.get("_editing"):
+        new_data.pop("_editing", None)
+        return ScenarioResult(render_review(new_data), "review", new_data)
+
+    history = list(new_data.get("_history") or [])
+    if not history:
+        return ScenarioResult(render_step(step, new_data), step, new_data)
+    previous = history.pop()
+    new_data["_history"] = history
+    return ScenarioResult(render_step(previous, new_data), previous, new_data)
+
+
+def _advance(step: str, data: dict[str, Any]) -> str:
+    editing = bool(data.get("_editing"))
+
+    if step == "departure_city":
+        next_step = "destination"
+    elif step == "destination":
+        next_step = "adults"
+    elif step == "adults":
+        next_step = "children_count"
+    elif step == "children_count":
+        next_step = "hotel_category" if _is_zero_children(str(data.get("children_count", ""))) else "children_ages"
+    elif step == "children_ages":
+        next_step = "hotel_category"
+    elif step == "hotel_category":
+        next_step = "meal_plan"
+    elif step == "meal_plan":
+        next_step = "nights"
+    elif step == "nights":
+        next_step = "dates"
+    elif step == "dates":
+        next_step = "name"
+    elif step == "name":
+        next_step = "contact_method"
+    elif step == "contact_method":
+        next_step = "phone" if data.get("contact_method") == CONTACT_PHONE else "review"
+    elif step == "phone":
+        next_step = "review"
+    else:
+        next_step = "review"
+
+    if editing:
+        # Для зависимых шагов сначала собираем необходимое продолжение, затем возвращаемся к ревью.
+        if step == "children_count" and next_step == "children_ages":
+            return next_step
+        if step == "contact_method" and next_step == "phone":
+            return next_step
+        if step in {"children_ages", "phone"} or next_step not in {"children_ages", "phone"}:
+            data.pop("_editing", None)
+            return "review"
+
+    return next_step
+
+
+def consume(step: str, value: str, data: dict[str, Any]) -> ScenarioResult:
+    value = value.strip()
     if not value:
-        return ScenarioResult(PROMPTS[step], step, data)
+        return ScenarioResult(render_step(step, data), step, data, validation_error=True)
 
     new_data = dict(data)
+    history = list(new_data.get("_history") or [])
 
-    if step == "destination":
-        new_data["destination"] = value
-        return ScenarioResult(PROMPTS["dates"], "dates", new_data)
-
-    if step == "dates":
-        new_data["travel_dates"] = value
-        return ScenarioResult(PROMPTS["travelers"], "travelers", new_data)
-
-    if step == "travelers":
-        new_data["travelers"] = value
-        return ScenarioResult(PROMPTS["nights"], "nights", new_data)
-
-    if step == "nights":
-        new_data["nights"] = value
-        return ScenarioResult(PROMPTS["name"], "name", new_data)
-
-    if step == "name":
-        new_data["client_name"] = value
-        return ScenarioResult(PROMPTS["contact_method"], "contact_method", new_data)
+    field_map = {
+        "departure_city": "departure_city",
+        "destination": "destination",
+        "adults": "adults",
+        "children_count": "children_count",
+        "children_ages": "children_ages",
+        "hotel_category": "hotel_category",
+        "meal_plan": "meal_plan",
+        "nights": "nights",
+        "dates": "travel_dates",
+        "name": "client_name",
+        "phone": "phone",
+    }
 
     if step == "contact_method":
-        lowered = value.lower()
-        if lowered in {"чат", "в чате", "chat"}:
-            new_data["contact_method"] = CONTACT_CHAT
-            return ScenarioResult(
-                "Спасибо! Заявка сформирована. Менеджер продолжит общение с вами в чате 😊",
-                None,
-                new_data,
-                completed=True,
-            )
-        if lowered in {"телефон", "звонок", "позвонить", "phone"}:
-            new_data["contact_method"] = CONTACT_PHONE
-            return ScenarioResult(PROMPTS["phone"], "phone", new_data)
-        return ScenarioResult(
-            "Выберите, пожалуйста: «В чате» или «По телефону».",
-            "contact_method",
-            new_data,
-        )
+        lowered = value.casefold()
+        if value in {CONTACT_CHAT, CONTACT_PHONE}:
+            normalized = value
+        elif lowered in {"чат", "в чате", "chat", "💬 в чате"}:
+            normalized = CONTACT_CHAT
+        elif lowered in {"телефон", "по телефону", "звонок", "позвонить", "phone", "📞 по телефону"}:
+            normalized = CONTACT_PHONE
+        else:
+            return ScenarioResult(render_step(step, new_data) + "\n\n⚠️ Выберите чат или телефон.", step, new_data, True)
+        new_data["contact_method"] = normalized
+    elif step in field_map:
+        new_data[field_map[step]] = value
+    else:
+        return ScenarioResult(render_step(step, new_data), step, new_data, True)
 
-    if step == "phone":
-        new_data["phone"] = value
-        return ScenarioResult(
-            "Спасибо! Заявка сформирована. Менеджер свяжется с вами по телефону 😊",
-            None,
-            new_data,
-            completed=True,
-        )
+    if not new_data.get("_editing"):
+        history.append(step)
+        new_data["_history"] = history
 
-    return start_scenario()
+    next_step = _advance(step, new_data)
+    if next_step == "review":
+        return ScenarioResult(render_review(new_data), "review", new_data)
+    return ScenarioResult(render_step(next_step, new_data), next_step, new_data)
