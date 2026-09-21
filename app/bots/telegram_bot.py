@@ -3,8 +3,13 @@ import logging
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
-
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from aiogram.client.session.aiohttp import AiohttpSession
 from app.config import Settings
 from app.db import SessionLocal
 from app.scenario import CONTACT_CHAT, CONTACT_PHONE, consume, start_scenario
@@ -41,7 +46,9 @@ def create_router(settings: Settings, max_sender=None) -> Router:
 
     @router.message(Command("whoami"))
     async def whoami(message: Message) -> None:
-        await message.answer(f"Telegram user_id: {message.from_user.id}\nchat_id: {message.chat.id}")
+        await message.answer(
+            f"Telegram user_id: {message.from_user.id}\nchat_id: {message.chat.id}"
+        )
 
     @router.message(CommandStart())
     async def start(message: Message) -> None:
@@ -77,7 +84,9 @@ def create_router(settings: Settings, max_sender=None) -> Router:
             )
             await set_subscription(session, user, enabled=True)
             await session.commit()
-        await message.answer("Подписка на рассылку включена ✅\nОтписаться можно в любой момент командой /unsubscribe.")
+        await message.answer(
+            "Подписка на рассылку включена ✅\nОтписаться можно в любой момент командой /unsubscribe."
+        )
 
     @router.message(Command("unsubscribe"))
     async def unsubscribe(message: Message) -> None:
@@ -92,7 +101,9 @@ def create_router(settings: Settings, max_sender=None) -> Router:
             )
             await set_subscription(session, user, enabled=False)
             await session.commit()
-        await message.answer("Рассылка отключена. Вернуть её можно командой /subscribe.")
+        await message.answer(
+            "Рассылка отключена. Вернуть её можно командой /subscribe."
+        )
 
     @router.message(Command("stats"))
     async def show_stats(message: Message) -> None:
@@ -135,10 +146,14 @@ def create_router(settings: Settings, max_sender=None) -> Router:
                     sent += 1
             except Exception:
                 failed += 1
-                log.exception("Broadcast failed for %s:%s", user.platform, user.platform_user_id)
+                log.exception(
+                    "Broadcast failed for %s:%s", user.platform, user.platform_user_id
+                )
             await asyncio.sleep(settings.broadcast_delay_seconds)
 
-        await message.answer(f"Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+        await message.answer(
+            f"Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
+        )
 
     @router.message(F.text)
     async def text_handler(message: Message, bot: Bot) -> None:
@@ -189,7 +204,11 @@ def create_router(settings: Settings, max_sender=None) -> Router:
             )
             await session.commit()
 
-        markup = contact_keyboard() if result.next_step == "contact_method" else ReplyKeyboardRemove()
+        markup = (
+            contact_keyboard()
+            if result.next_step == "contact_method"
+            else ReplyKeyboardRemove()
+        )
         await message.answer(result.reply, reply_markup=markup)
 
     return router
@@ -200,10 +219,21 @@ async def run_telegram(settings: Settings, max_sender=None) -> None:
         log.warning("Telegram disabled: token missing or polling disabled")
         return
 
-    bot = Bot(settings.telegram_token)
+    if settings.telegram_proxy:
+        session = AiohttpSession(proxy=settings.telegram_proxy)
+        bot = Bot(settings.telegram_token, session=session)
+    else:
+        bot = Bot(settings.telegram_token)
+
+    # На разработке работаем через polling.
+    # Если раньше у бота был webhook — удаляем его.
+    await bot.delete_webhook(drop_pending_updates=False)
+
     dp = Dispatcher()
     dp.include_router(create_router(settings, max_sender=max_sender))
+
     log.info("Telegram polling started")
+
     try:
         await dp.start_polling(bot)
     finally:

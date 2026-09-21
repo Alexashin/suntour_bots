@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     max_webhook_secret: str = "change_me_please"
     max_marketing_broadcast_enabled: bool = False
     public_domain: str = ""
+    telegram_proxy: str = ""
 
     broadcast_delay_seconds: float = Field(default=0.55, ge=0.0)
 

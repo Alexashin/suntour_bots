@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+from aiogram import Bot
 import uvicorn
 
 from app.api import create_api
@@ -8,6 +9,7 @@ from app.bots.max_bot import MaxClient, run_max_polling
 from app.bots.telegram_bot import run_telegram
 from app.config import get_settings
 from app.db import init_db
+from aiogram.client.session.aiohttp import AiohttpSession
 
 
 async def serve_api(app) -> None:
@@ -20,6 +22,45 @@ async def serve_api(app) -> None:
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+async def log_bot_info(settings, max_client):
+    log = logging.getLogger("app")
+
+    if settings.telegram_token:
+        if settings.telegram_proxy:
+            session = AiohttpSession(proxy=settings.telegram_proxy)
+            tg_bot = Bot(settings.telegram_token, session=session)
+        else:
+            tg_bot = Bot(settings.telegram_token)
+
+        try:
+            me = await tg_bot.get_me()
+            log.info(
+                "Telegram bot: @%s | https://t.me/%s",
+                me.username,
+                me.username,
+            )
+        finally:
+            await tg_bot.session.close()
+
+    if settings.max_token:
+        try:
+            me = await max_client._request("GET", "/me")
+            username = me.get("username")
+            name = me.get("name")
+
+            log.info(
+                "MAX bot: %s | username=%s",
+                name,
+                username,
+            )
+
+            if username:
+                log.info("MAX link: https://max.ru/%s", username)
+
+        except Exception:
+            log.exception("Could not fetch MAX bot info")
 
 
 async def main() -> None:
@@ -35,6 +76,8 @@ async def main() -> None:
 
     max_client = MaxClient(settings)
     await max_client.open()
+
+    await log_bot_info(settings, max_client)
 
     api = create_api(settings, max_client)
     tasks: list[asyncio.Task] = [
