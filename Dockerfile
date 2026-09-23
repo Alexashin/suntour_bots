@@ -18,7 +18,6 @@ RUN update-ca-certificates
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Tests are a required build gate. If pytest fails, the image is not built.
 FROM base AS test
 COPY requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt
@@ -27,8 +26,10 @@ COPY tests ./tests
 RUN pytest -q && touch /tmp/tests-passed
 
 FROM base AS runtime
-# This COPY intentionally depends on the test stage so BuildKit cannot skip it.
 COPY --from=test /tmp/tests-passed /tmp/tests-passed
 COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
+COPY entrypoint.sh ./entrypoint.sh
 
-CMD ["python", "-m", "app.main"]
+CMD ["./entrypoint.sh"]

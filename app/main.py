@@ -7,7 +7,6 @@ from app.api import create_api
 from app.bots.max_bot import MaxClient, run_max_polling
 from app.bots.telegram_bot import run_telegram
 from app.config import get_settings
-from app.db import init_db
 from app.logging_config import configure_logging
 from app.notifier import AdminNotifier
 from app.telegram_factory import create_telegram_bot
@@ -71,9 +70,6 @@ async def main() -> None:
             len(settings.max_admin_chat_id_list),
         )
 
-    await init_db()
-    log.info("Database initialized")
-
     max_client = MaxClient(settings) if settings.max_token else None
     if max_client:
         await max_client.open()
@@ -90,6 +86,7 @@ async def main() -> None:
     api = create_api(settings, max_client, notifier)
     tasks: list[asyncio.Task] = [
         asyncio.create_task(serve_api(api, settings.log_level), name="api"),
+        asyncio.create_task(notifier.broadcast_worker(), name="broadcast-worker"),
     ]
 
     if telegram_bot and settings.telegram_enable_polling:

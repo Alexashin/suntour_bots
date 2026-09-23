@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     telegram_proxy: str = ""
 
     broadcast_delay_seconds: float = Field(default=0.55, ge=0.0)
+    media_storage_dir: str = "/app/data/media"
 
     @property
     def telegram_admin_id_list(self) -> list[int]:
