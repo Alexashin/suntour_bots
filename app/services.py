@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Broadcast, BroadcastDelivery, Conversation, Lead, LeadMessage, User, UserEvent
@@ -95,10 +95,23 @@ async def get_or_create_conversation(session: AsyncSession, *, platform: str, pl
     return conv
 
 
+# Интервалы считаются от момента последней активности пользователя / предыдущего напоминания.
+# 5 минут -> ещё 30 минут -> ещё 3 часа -> ещё 24 часа, после чего напоминания прекращаются.
+WIZARD_REMINDER_DELAYS = (
+    timedelta(minutes=5),
+    timedelta(minutes=30),
+    timedelta(hours=3),
+    timedelta(hours=24),
+)
+
+
 async def reset_conversation(session: AsyncSession, *, platform: str, platform_user_id: int) -> Conversation:
     conv = await get_or_create_conversation(session, platform=platform, platform_user_id=platform_user_id)
     conv.step = "idle"
     conv.data = {"_history": []}
+    conv.reminder_stage = 0
+    conv.reminder_next_at = None
+    conv.reminder_last_sent_at = None
     await session.flush()
     return conv
 
@@ -107,6 +120,71 @@ async def save_conversation(session: AsyncSession, conv: Conversation, *, step: 
     conv.step = step
     conv.data = data
     await session.flush()
+
+
+async def arm_wizard_reminder(session: AsyncSession, conv: Conversation, *, reset_stage: bool = True) -> None:
+    """Schedule a restart-safe reminder for an unfinished wizard.
+
+    The schedule is stored in PostgreSQL rather than in asyncio.sleep tasks, so a
+    process restart or deploy does not lose the reminder state and no bot handler
+    waits on a timer.
+    """
+    if conv.step in {"idle", "complete", "admin_broadcast"}:
+        conv.reminder_next_at = None
+        await session.flush()
+        return
+    now = datetime.now(timezone.utc)
+    if reset_stage:
+        conv.reminder_stage = 0
+        conv.reminder_last_sent_at = None
+    stage = min(max(int(conv.reminder_stage or 0), 0), len(WIZARD_REMINDER_DELAYS) - 1)
+    conv.reminder_next_at = now + WIZARD_REMINDER_DELAYS[stage]
+    await session.flush()
+
+
+async def claim_due_wizard_reminders(
+    session: AsyncSession, *, limit: int = 25
+) -> list[tuple[int, User, int, str, dict[str, Any]]]:
+    """Atomically claim due reminders.
+
+    FOR UPDATE SKIP LOCKED prevents duplicate claims if the app is ever scaled to
+    more than one worker. The next schedule is persisted before network I/O.
+    """
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(Conversation, User)
+        .join(
+            User,
+            and_(
+                User.platform == Conversation.platform,
+                User.platform_user_id == Conversation.platform_user_id,
+            ),
+        )
+        .where(
+            Conversation.reminder_next_at.is_not(None),
+            Conversation.reminder_next_at <= now,
+            Conversation.step.notin_(["idle", "complete", "admin_broadcast"]),
+        )
+        .order_by(Conversation.reminder_next_at.asc())
+        .with_for_update(of=Conversation, skip_locked=True)
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
+    claimed: list[tuple[int, User, int, str, dict[str, Any]]] = []
+    for conv, user in rows:
+        stage = int(conv.reminder_stage or 0)
+        if stage >= len(WIZARD_REMINDER_DELAYS):
+            conv.reminder_next_at = None
+            continue
+        claimed.append((conv.id, user, stage, conv.step, dict(conv.data or {})))
+        conv.reminder_stage = stage + 1
+        conv.reminder_last_sent_at = now
+        if conv.reminder_stage < len(WIZARD_REMINDER_DELAYS):
+            conv.reminder_next_at = now + WIZARD_REMINDER_DELAYS[conv.reminder_stage]
+        else:
+            conv.reminder_next_at = None
+    await session.flush()
+    return claimed
 
 
 def _lead_contact_snapshot(user: User, contact_method: str, phone: str | None) -> tuple[str | None, str | None, str]:
@@ -210,7 +288,6 @@ def format_lead(lead: Lead, user: User, *, render_platform: str = "telegram") ->
         f"Источник: {platform_label}\nКлиент: {escape(lead.client_name)}\nПрофиль: {account}\n"
         f"✈️ Вылет: {escape(str(d.get('departure_city', '—')))}\n🌍 Направление: {escape(str(d.get('destination', '—')))}\n"
         f"👤 Взрослых: {escape(str(d.get('adults', '—')))}\n👶 Дети: {children}\n"
-        f"🏨 Отель: {escape(str(d.get('hotel_category', '—')))}\n🍽 Питание: {escape(str(d.get('meal_plan', '—')))}\n"
         f"🌙 Ночей: {escape(str(d.get('nights', '—')))}\n📅 Даты: {escape(str(d.get('travel_dates', '—')))}\n"
         f"{_contact_block(lead, user, render_platform)}"
         + _status_block(lead)
@@ -287,7 +364,15 @@ async def subscribed_users(session: AsyncSession, target: str = "both") -> list[
     return list(result.scalars().all())
 
 
-async def set_subscription(session: AsyncSession, user: User, *, enabled: bool) -> None:
+async def set_subscription(session: AsyncSession, user: User, *, enabled: bool) -> bool:
+    """Idempotently change subscription state.
+
+    Starting the tour wizard can happen many times. If a user is already
+    subscribed we do not rewrite subscribed_at or create duplicate events. If
+    they previously unsubscribed, starting a new tour subscribes them again.
+    """
+    if bool(user.subscribed) == enabled:
+        return False
     now = datetime.now(timezone.utc)
     user.subscribed = enabled
     if enabled:
@@ -297,6 +382,7 @@ async def set_subscription(session: AsyncSession, user: User, *, enabled: bool) 
         user.unsubscribed_at = now
     await log_user_event(session, user, "subscribed" if enabled else "unsubscribed")
     await session.flush()
+    return True
 
 
 async def create_broadcast(

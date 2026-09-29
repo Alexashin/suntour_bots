@@ -11,6 +11,7 @@ from app.db import SessionLocal
 from app.services import (
     BROADCAST_CANCELLED,
     BROADCAST_SENDING,
+    claim_due_wizard_reminders,
     LEAD_PROCESSED,
     add_lead_message,
     finalize_broadcast,
@@ -143,6 +144,80 @@ class AdminNotifier:
             except Exception:
                 log.warning("Could not sync admin lead message lead_id=%s platform=%s message_id=%s",
                             lead_id, item.platform, item.message_id, exc_info=True)
+
+
+
+    @staticmethod
+    def _reminder_text(stage: int, data: dict) -> str:
+        raw_name = str(data.get("client_name") or "").strip()
+        name = escape(raw_name)
+        if stage == 0:
+            prefix = f"{name}, вы" if name else "Вы"
+            return f"{prefix} не закончили подбор тура 🙂\n\nПродолжим? Осталось совсем немного."
+        if stage == 1:
+            return "Напоминаем про заявку на подбор тура ✈️\n\nМожно продолжить с того же места — ответы уже сохранены."
+        if stage == 2:
+            return "Подбор тура всё ещё сохранён 🌴\n\nЕсли поездка актуальна, продолжим с того места, где остановились."
+        return "Последнее напоминание о незавершённой заявке 🙂\n\nЕсли поездка ещё актуальна — продолжите подбор ниже."
+
+    @staticmethod
+    def _telegram_reminder_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить подбор", callback_data="wiz|resume")],
+            [InlineKeyboardButton(text="❌ Отменить подбор", callback_data="wiz|cancel")],
+        ])
+
+    async def _send_wizard_reminder(self, user, stage: int, data: dict) -> None:
+        text = self._reminder_text(stage, data)
+        if user.platform == "telegram":
+            if not self.telegram_bot or not user.chat_id:
+                raise RuntimeError("Telegram reminder destination unavailable")
+            await self.telegram_bot.send_message(
+                user.chat_id, text, parse_mode="HTML", reply_markup=self._telegram_reminder_keyboard(),
+            )
+            return
+        if user.platform == "max":
+            if not self.max_client:
+                raise RuntimeError("MAX reminder destination unavailable")
+            keyboard = self.max_client.callback_keyboard([
+                [("▶️ Продолжить подбор", "wiz|resume")],
+                [("❌ Отменить подбор", "wiz|cancel")],
+            ])
+            await self.max_client.send_to_user(user.platform_user_id, text, keyboard=keyboard)
+            return
+        raise RuntimeError(f"Unsupported reminder platform: {user.platform}")
+
+    async def incomplete_wizard_worker(self) -> None:
+        """Send persistent, non-blocking reminders for abandoned questionnaires.
+
+        Timers live in PostgreSQL. This worker only claims due rows periodically,
+        so neither Telegram nor MAX handlers ever sleep waiting for a reminder.
+        """
+        log.info("Incomplete wizard reminder worker started")
+        while True:
+            try:
+                async with SessionLocal() as session:
+                    claims = await claim_due_wizard_reminders(session, limit=25)
+                    await session.commit()
+                for conversation_id, user, stage, step, data in claims:
+                    try:
+                        await self._send_wizard_reminder(user, stage, data)
+                        log.info(
+                            "Wizard reminder sent conversation_id=%s platform=%s user_id=%s stage=%s step=%s",
+                            conversation_id, user.platform, user.platform_user_id, stage + 1, step,
+                        )
+                    except Exception:
+                        log.warning(
+                            "Wizard reminder failed conversation_id=%s platform=%s user_id=%s stage=%s",
+                            conversation_id, user.platform, user.platform_user_id, stage + 1, exc_info=True,
+                        )
+                    await asyncio.sleep(self.settings.broadcast_delay_seconds)
+                await asyncio.sleep(15.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Incomplete wizard reminder worker error")
+                await asyncio.sleep(5.0)
 
     @staticmethod
     def _telegram_broadcast_keyboard(url: str | None, text: str | None):

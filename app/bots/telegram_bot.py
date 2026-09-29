@@ -37,6 +37,7 @@ from app.scenario import (
 from app.services import (
     LEAD_NEW,
     LEAD_PROCESSED,
+    arm_wizard_reminder,
     cancel_broadcast,
     create_broadcast,
     create_lead,
@@ -311,46 +312,107 @@ async def _subscribe_callback(callback: CallbackQuery, enabled: bool, settings: 
 
 
 async def _start_flow_from_callback(callback: CallbackQuery, bot: Bot) -> None:
+    result = start_scenario()
     async with SessionLocal() as session:
-        user = await upsert_user(session, platform="telegram", platform_user_id=callback.from_user.id, chat_id=callback.message.chat.id,
-                          username=callback.from_user.username, display_name=callback.from_user.full_name,
-                          first_name=callback.from_user.first_name, last_name=callback.from_user.last_name,
-                          language_code=callback.from_user.language_code, is_premium=getattr(callback.from_user, "is_premium", None))
+        user = await upsert_user(
+            session, platform="telegram", platform_user_id=callback.from_user.id, chat_id=callback.message.chat.id,
+            username=callback.from_user.username, display_name=callback.from_user.full_name,
+            first_name=callback.from_user.first_name, last_name=callback.from_user.last_name,
+            language_code=callback.from_user.language_code, is_premium=getattr(callback.from_user, "is_premium", None),
+        )
+        # Подбор тура всегда включает рассылку. Повторный подбор безопасен:
+        # set_subscription идемпотентен и не создаёт повторных событий.
+        await set_subscription(session, user, enabled=True)
         await log_user_event(session, user, "wizard_started")
         conv = await reset_conversation(session, platform="telegram", platform_user_id=callback.from_user.id)
-        data = dict(conv.data)
-        data["_ui_message_id"] = callback.message.message_id
-        await save_conversation(session, conv, step="departure_city", data=data)
+        result.data["_ui_message_id"] = callback.message.message_id
+        await save_conversation(session, conv, step=result.next_step, data=result.data)
+        await arm_wizard_reminder(session, conv)
         await session.commit()
-    result = start_scenario()
-    result.data["_ui_message_id"] = callback.message.message_id
     await callback.answer()
-    await _render_card(bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, text=result.reply,
-                       step=result.next_step, data=result.data, display_name=callback.from_user.full_name,
-                       preferred_message_id=callback.message.message_id)
+    await _render_card(
+        bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, text=result.reply,
+        step=result.next_step, data=result.data, display_name=callback.from_user.full_name,
+        preferred_message_id=callback.message.message_id,
+    )
 
 
-async def _apply_value(*, bot: Bot, user_id: int, chat_id: int, display_name: str | None, username: str | None,
-                       value: str, preferred_message_id: int | None = None) -> None:
+async def _show_lead_sent(
+    bot: Bot, *, chat_id: int, user_id: int, settings: Settings, subscribed: bool,
+    preferred_message_id: int | None = None, remove_phone_keyboard: bool = False,
+) -> None:
+    if remove_phone_keyboard:
+        await bot.send_message(chat_id, "Номер получен ✅", reply_markup=ReplyKeyboardRemove())
+    text = (
+        "✅ <b>Заявка отправлена!</b>\n\n"
+        "Менеджер «Солнечных туров» свяжется с вами и предложит подходящие варианты."
+    )
+    markup = main_menu_keyboard(subscribed=subscribed, is_admin=user_id in settings.telegram_admin_id_list)
+    if preferred_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=int(preferred_message_id), text=text,
+                reply_markup=markup, parse_mode="HTML",
+            )
+            return
+        except TelegramBadRequest:
+            log.debug("Telegram completion card edit failed; sending new card", exc_info=True)
+    await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+async def _apply_value(
+    *, bot: Bot, notifier, settings: Settings, user_id: int, chat_id: int,
+    display_name: str | None, username: str | None, value: str,
+    preferred_message_id: int | None = None,
+) -> None:
+    lead_id: int | None = None
+    subscribed = True
+    previous_step = ""
+    ui_mid = preferred_message_id
     async with SessionLocal() as session:
-        user = await upsert_user(session, platform="telegram", platform_user_id=user_id, chat_id=chat_id,
-                          username=username, display_name=display_name)
+        user = await upsert_user(
+            session, platform="telegram", platform_user_id=user_id, chat_id=chat_id,
+            username=username, display_name=display_name,
+        )
         conv = await get_or_create_conversation(session, platform="telegram", platform_user_id=user_id)
         log.info("Telegram wizard input user_id=%s step=%s", user_id, conv.step)
         log.debug("Telegram wizard raw input user_id=%s value=%r", user_id, value)
+        if conv.step in {"idle", "complete"}:
+            return
         if conv.step == "review":
             return
         previous_step = conv.step
+        ui_mid = ui_mid or (conv.data or {}).get("_ui_message_id")
         await log_user_event(session, user, "wizard_answer", {"step": previous_step, "value": value})
         result = consume(conv.step, value, conv.data)
-        await save_conversation(session, conv, step=result.next_step, data=result.data)
+        if result.next_step == "complete":
+            lead = await create_lead(session, user=user, data=result.data)
+            lead_id = lead.id
+            subscribed = bool(user.subscribed)
+            await reset_conversation(session, platform="telegram", platform_user_id=user_id)
+        else:
+            await save_conversation(session, conv, step=result.next_step, data=result.data)
+            await arm_wizard_reminder(session, conv)
         await session.commit()
-    await _render_card(bot, chat_id=chat_id, user_id=user_id, text=result.reply, step=result.next_step,
-                       data=result.data, display_name=display_name, preferred_message_id=preferred_message_id)
+
+    if lead_id is not None:
+        log.info("Telegram lead auto-submitted lead_id=%s user_id=%s", lead_id, user_id)
+        await _show_lead_sent(
+            bot, chat_id=chat_id, user_id=user_id, settings=settings, subscribed=subscribed,
+            preferred_message_id=ui_mid, remove_phone_keyboard=previous_step == "phone",
+        )
+        await notifier.notify_lead(lead_id)
+        return
+
+    await _render_card(
+        bot, chat_id=chat_id, user_id=user_id, text=result.reply, step=result.next_step,
+        data=result.data, display_name=display_name, preferred_message_id=preferred_message_id,
+    )
     if result.next_step == "phone":
-        await bot.send_message(chat_id, "Для звонка можете отправить номер кнопкой ниже или написать его вручную.", reply_markup=phone_reply_keyboard())
-    elif previous_step == "phone":
-        await bot.send_message(chat_id, "Номер получен ✅", reply_markup=ReplyKeyboardRemove())
+        await bot.send_message(
+            chat_id, "Для звонка можете отправить номер кнопкой ниже или написать его вручную.",
+            reply_markup=phone_reply_keyboard(),
+        )
 
 
 async def _submit_lead(callback: CallbackQuery, notifier, settings: Settings) -> None:
@@ -627,40 +689,133 @@ def create_router(settings: Settings, notifier, max_sender=None) -> Router:
     async def wizard_callback(callback: CallbackQuery, bot: Bot) -> None:
         parts = callback.data.split("|")
         action = parts[1]
+        lead_id: int | None = None
+        subscribed = True
+
         async with SessionLocal() as session:
+            user = await upsert_user(
+                session, platform="telegram", platform_user_id=callback.from_user.id, chat_id=callback.message.chat.id,
+                username=callback.from_user.username, display_name=callback.from_user.full_name,
+                first_name=callback.from_user.first_name, last_name=callback.from_user.last_name,
+                language_code=callback.from_user.language_code, is_premium=getattr(callback.from_user, "is_premium", None),
+            )
             conv = await get_or_create_conversation(session, platform="telegram", platform_user_id=callback.from_user.id)
             step = conv.step
             data = dict(conv.data or {})
             data["_ui_message_id"] = callback.message.message_id
+
+            if action == "resume":
+                if step in {"idle", "complete", "admin_broadcast"}:
+                    await session.commit()
+                    await callback.answer("Подбор уже завершён")
+                    subscribed_now, admin = await _menu_state(callback.from_user.id, settings)
+                    await _replace_with_text(
+                        callback.message,
+                        "🌴 <b>Солнечные туры</b>\n\nВыберите, что хотите сделать:",
+                        reply_markup=main_menu_keyboard(subscribed=subscribed_now, is_admin=admin),
+                    )
+                    return
+                await save_conversation(session, conv, step=step, data=data)
+                await arm_wizard_reminder(session, conv)
+                await session.commit()
+                await callback.answer()
+                text = render_review(data) if step == "review" else render_step(step, data)
+                await _render_card(
+                    bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, text=text,
+                    step=step, data=data, display_name=callback.from_user.full_name,
+                    preferred_message_id=callback.message.message_id,
+                )
+                if step == "phone":
+                    await callback.message.answer(
+                        "Для звонка отправьте номер кнопкой ниже или введите вручную.",
+                        reply_markup=phone_reply_keyboard(),
+                    )
+                return
+
             if action == "set" and len(parts) >= 3:
                 value = resolve_choice(step, parts[2], data, display_name=callback.from_user.full_name)
                 if value is None:
-                    await callback.answer("Этот вариант уже неактуален", show_alert=True); return
+                    await callback.answer("Этот вариант уже неактуален", show_alert=True)
+                    return
+                await log_user_event(session, user, "wizard_answer", {"step": step, "value": value})
                 result = consume(step, value, data)
-            elif action == "back": result = go_back(step, data)
+            elif action == "back":
+                result = go_back(step, data)
             elif action == "review":
-                data.pop("_editing", None); result = type("R", (), {"reply": render_review(data), "next_step": "review", "data": data})()
+                data.pop("_editing", None)
+                result = type("R", (), {"reply": render_review(data), "next_step": "review", "data": data})()
             elif action == "edit":
-                await save_conversation(session, conv, step="review", data=data); await session.commit(); await callback.answer()
-                await callback.message.edit_text("✏️ <b>Что хотите изменить?</b>\n\nПосле изменения бот вернёт вас к проверке заявки.", reply_markup=edit_menu_keyboard(), parse_mode="HTML"); return
-            elif action == "editstep" and len(parts) >= 3: result = edit_step(data, parts[2])
+                await save_conversation(session, conv, step="review", data=data)
+                await arm_wizard_reminder(session, conv)
+                await session.commit()
+                await callback.answer()
+                await callback.message.edit_text(
+                    "✏️ <b>Что хотите изменить?</b>\n\nПосле изменения бот вернёт вас к проверке заявки.",
+                    reply_markup=edit_menu_keyboard(), parse_mode="HTML",
+                )
+                return
+            elif action == "editstep" and len(parts) >= 3:
+                result = edit_step(data, parts[2])
             elif action == "manual":
+                await save_conversation(session, conv, step=step, data=data)
+                await arm_wizard_reminder(session, conv)
+                await session.commit()
                 await callback.answer("Напишите свой вариант обычным сообщением")
-                await callback.message.edit_text(render_step(step, data) + "\n\n✍️ <i>Напишите ответ обычным сообщением.</i>", reply_markup=wizard_keyboard(step, data, display_name=callback.from_user.full_name), parse_mode="HTML"); return
+                await callback.message.edit_text(
+                    render_step(step, data) + "\n\n✍️ <i>Напишите ответ обычным сообщением.</i>",
+                    reply_markup=wizard_keyboard(step, data, display_name=callback.from_user.full_name), parse_mode="HTML",
+                )
+                return
             elif action == "cancel":
-                await reset_conversation(session, platform="telegram", platform_user_id=callback.from_user.id); await session.commit(); await callback.answer("Подбор отменён")
-                subscribed, admin = await _menu_state(callback.from_user.id, settings)
-                await callback.message.edit_text("Подбор тура отменён.", reply_markup=main_menu_keyboard(subscribed=subscribed, is_admin=admin)); return
+                await reset_conversation(session, platform="telegram", platform_user_id=callback.from_user.id)
+                await session.commit()
+                await callback.answer("Подбор отменён")
+                subscribed_now, admin = await _menu_state(callback.from_user.id, settings)
+                await callback.message.edit_text(
+                    "Подбор тура отменён.",
+                    reply_markup=main_menu_keyboard(subscribed=subscribed_now, is_admin=admin),
+                )
+                return
             elif action == "submit":
-                await session.rollback(); await _submit_lead(callback, notifier, settings); return
+                # Совместимость с заявками, которые дошли до review в старой версии.
+                await session.rollback()
+                await _submit_lead(callback, notifier, settings)
+                return
             else:
-                await callback.answer(); return
-            await save_conversation(session, conv, step=result.next_step, data=result.data); await session.commit()
+                await callback.answer()
+                return
+
+            if result.next_step == "complete":
+                lead = await create_lead(session, user=user, data=result.data)
+                lead_id = lead.id
+                subscribed = bool(user.subscribed)
+                await reset_conversation(session, platform="telegram", platform_user_id=callback.from_user.id)
+            else:
+                await save_conversation(session, conv, step=result.next_step, data=result.data)
+                await arm_wizard_reminder(session, conv)
+            await session.commit()
+
+        if lead_id is not None:
+            log.info("Telegram lead auto-submitted lead_id=%s user_id=%s", lead_id, callback.from_user.id)
+            await callback.answer("Заявка отправлена ✅")
+            await _show_lead_sent(
+                bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, settings=settings,
+                subscribed=subscribed, preferred_message_id=callback.message.message_id,
+            )
+            await notifier.notify_lead(lead_id)
+            return
+
         await callback.answer()
-        await _render_card(bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, text=result.reply, step=result.next_step,
-                           data=result.data, display_name=callback.from_user.full_name, preferred_message_id=callback.message.message_id)
+        await _render_card(
+            bot, chat_id=callback.message.chat.id, user_id=callback.from_user.id, text=result.reply,
+            step=result.next_step, data=result.data, display_name=callback.from_user.full_name,
+            preferred_message_id=callback.message.message_id,
+        )
         if result.next_step == "phone":
-            await callback.message.answer("Для звонка отправьте номер кнопкой ниже или введите вручную.", reply_markup=phone_reply_keyboard())
+            await callback.message.answer(
+                "Для звонка отправьте номер кнопкой ниже или введите вручную.",
+                reply_markup=phone_reply_keyboard(),
+            )
 
     @router.message(F.photo | F.video)
     async def broadcast_media_handler(message: Message, bot: Bot) -> None:
@@ -695,8 +850,11 @@ def create_router(settings: Settings, notifier, max_sender=None) -> Router:
         if message.contact.user_id is not None and message.contact.user_id != message.from_user.id:
             await message.answer("Пожалуйста, отправьте свой номер или введите его вручную."); return
         await _safe_delete_user_message(message)
-        await _apply_value(bot=bot, user_id=message.from_user.id, chat_id=message.chat.id, display_name=message.from_user.full_name,
-                           username=message.from_user.username, value=message.contact.phone_number)
+        await _apply_value(
+            bot=bot, notifier=notifier, settings=settings, user_id=message.from_user.id, chat_id=message.chat.id,
+            display_name=message.from_user.full_name, username=message.from_user.username,
+            value=message.contact.phone_number,
+        )
 
     @router.message(F.text)
     async def text_handler(message: Message, bot: Bot) -> None:
@@ -766,8 +924,10 @@ def create_router(settings: Settings, notifier, max_sender=None) -> Router:
                 await message.answer("Используйте кнопки под заявкой: отправить или изменить параметры."); return
         value = message.text.strip()
         await _safe_delete_user_message(message)
-        await _apply_value(bot=bot, user_id=message.from_user.id, chat_id=message.chat.id, display_name=message.from_user.full_name,
-                           username=message.from_user.username, value=value)
+        await _apply_value(
+            bot=bot, notifier=notifier, settings=settings, user_id=message.from_user.id, chat_id=message.chat.id,
+            display_name=message.from_user.full_name, username=message.from_user.username, value=value,
+        )
 
     return router
 

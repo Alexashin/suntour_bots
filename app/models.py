@@ -63,8 +63,11 @@ class Conversation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     platform: Mapped[str] = mapped_column(String(16), index=True)
     platform_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    step: Mapped[str] = mapped_column(String(64), default="departure_city")
+    step: Mapped[str] = mapped_column(String(64), default="name")
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    reminder_stage: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    reminder_next_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    reminder_last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

@@ -28,6 +28,7 @@ from app.scenario import (
 from app.services import (
     LEAD_NEW,
     LEAD_PROCESSED,
+    arm_wizard_reminder,
     cancel_broadcast,
     create_broadcast,
     create_lead,
@@ -436,6 +437,7 @@ async def _show_menu(client: MaxClient, user_id: int, chat_id: int | None, sende
 
 
 async def _start_flow(client: MaxClient, user_id: int, chat_id: int | None, sender: dict[str, Any]) -> None:
+    result = start_scenario()
     async with SessionLocal() as session:
         user = await upsert_user(
             session,
@@ -445,11 +447,14 @@ async def _start_flow(client: MaxClient, user_id: int, chat_id: int | None, send
             username=sender.get("username"),
             display_name=_display_name(sender), **_max_profile_kwargs(sender),
         )
+        # Подбор тура автоматически включает рассылку. Повторный запуск
+        # безопасен: set_subscription ничего не дублирует, если подписка уже есть.
+        await set_subscription(session, user, enabled=True)
         await log_user_event(session, user, "wizard_started")
         conv = await reset_conversation(session, platform="max", platform_user_id=user_id)
-        await save_conversation(session, conv, step="departure_city", data={"_history": []})
+        await save_conversation(session, conv, step=result.next_step, data=result.data)
+        await arm_wizard_reminder(session, conv)
         await session.commit()
-    result = start_scenario()
     log.info("MAX scenario started user_id=%s", user_id)
     await _render_card(client, user_id, result.reply, result.next_step, result.data, _display_name(sender))
 
@@ -473,7 +478,11 @@ async def _set_subscription(client: MaxClient, user_id: int, chat_id: int | None
     )
 
 
-async def _apply_value(client: MaxClient, user_id: int, chat_id: int | None, sender: dict[str, Any], value: str) -> None:
+async def _apply_value(
+    client: MaxClient, notifier, user_id: int, chat_id: int | None, sender: dict[str, Any], value: str
+) -> None:
+    lead_id: int | None = None
+    subscribed = True
     async with SessionLocal() as session:
         user = await upsert_user(
             session,
@@ -486,12 +495,34 @@ async def _apply_value(client: MaxClient, user_id: int, chat_id: int | None, sen
         conv = await get_or_create_conversation(session, platform="max", platform_user_id=user_id)
         log.info("MAX wizard input user_id=%s step=%s", user_id, conv.step)
         log.debug("MAX wizard raw input user_id=%s value=%r", user_id, value)
-        if conv.step == "review":
+        if conv.step in {"idle", "complete", "review"}:
             return
-        await log_user_event(session, user, "wizard_answer", {"step": conv.step, "value": value})
+        previous_step = conv.step
+        await log_user_event(session, user, "wizard_answer", {"step": previous_step, "value": value})
         result = consume(conv.step, value, conv.data)
-        await save_conversation(session, conv, step=result.next_step, data=result.data)
+        if result.next_step == "complete":
+            lead = await create_lead(session, user=user, data=result.data)
+            lead_id = lead.id
+            subscribed = bool(user.subscribed)
+            await reset_conversation(session, platform="max", platform_user_id=user_id)
+        else:
+            await save_conversation(session, conv, step=result.next_step, data=result.data)
+            await arm_wizard_reminder(session, conv)
         await session.commit()
+
+    if lead_id is not None:
+        log.info("MAX lead auto-submitted lead_id=%s user_id=%s", lead_id, user_id)
+        text = (
+            "✅ <b>Заявка отправлена!</b>\n\n"
+            "Менеджер «Солнечных туров» свяжется с вами и предложит подходящие варианты."
+        )
+        await client.send_to_user(
+            user_id, text,
+            keyboard=_main_menu_keyboard(subscribed=subscribed, is_admin=_is_admin(client.settings, user_id)),
+        )
+        await notifier.notify_lead(lead_id)
+        return
+
     await _render_card(client, user_id, result.reply, result.next_step, result.data, _display_name(sender))
 
 
@@ -700,17 +731,24 @@ async def _handle_callback(client: MaxClient, notifier, update: dict[str, Any]) 
             await _show_menu(client, user_id, chat_id, sender, callback_id=callback_id)
             return
         if action == "start":
-            async with SessionLocal() as session:
-                conv = await reset_conversation(session, platform="max", platform_user_id=user_id)
-                data = dict(conv.data or {})
-                if callback_mid:
-                    data["_ui_message_id"] = callback_mid
-                await save_conversation(session, conv, step="departure_city", data=data)
-                await session.commit()
             result = start_scenario()
-            if callback_mid:
-                result.data["_ui_message_id"] = callback_mid
-            await client.answer_callback(callback_id, result.reply, keyboard=_wizard_keyboard(result.next_step, result.data, _display_name(sender)))
+            async with SessionLocal() as session:
+                user = await upsert_user(
+                    session, platform="max", platform_user_id=user_id, chat_id=chat_id,
+                    username=sender.get("username"), display_name=_display_name(sender), **_max_profile_kwargs(sender),
+                )
+                await set_subscription(session, user, enabled=True)
+                await log_user_event(session, user, "wizard_started")
+                conv = await reset_conversation(session, platform="max", platform_user_id=user_id)
+                if callback_mid:
+                    result.data["_ui_message_id"] = callback_mid
+                await save_conversation(session, conv, step=result.next_step, data=result.data)
+                await arm_wizard_reminder(session, conv)
+                await session.commit()
+            await client.answer_callback(
+                callback_id, result.reply,
+                keyboard=_wizard_keyboard(result.next_step, result.data, _display_name(sender)),
+            )
             return
         if action in {"subscribe", "unsubscribe"}:
             enabled = action == "subscribe"
@@ -740,18 +778,43 @@ async def _handle_callback(client: MaxClient, notifier, update: dict[str, Any]) 
 
     parts = payload.split("|")
     action = parts[1]
+    lead_id: int | None = None
+    subscribed = True
+
     async with SessionLocal() as session:
+        user = await upsert_user(
+            session, platform="max", platform_user_id=user_id, chat_id=chat_id,
+            username=sender.get("username"), display_name=_display_name(sender), **_max_profile_kwargs(sender),
+        )
         conv = await get_or_create_conversation(session, platform="max", platform_user_id=user_id)
         step = conv.step
         data = dict(conv.data or {})
         if callback_mid:
             data["_ui_message_id"] = callback_mid
 
+        if action == "resume":
+            if step in {"idle", "complete", "admin_broadcast"}:
+                await session.commit()
+                subscribed_now, admin = await _menu_state(client.settings, user_id)
+                await client.answer_callback(
+                    callback_id, "🌴 <b>Солнечные туры</b>\n\nВыберите, что хотите сделать:",
+                    keyboard=_main_menu_keyboard(subscribed=subscribed_now, is_admin=admin),
+                )
+                return
+            await save_conversation(session, conv, step=step, data=data)
+            await arm_wizard_reminder(session, conv)
+            await session.commit()
+            text = render_review(data) if step == "review" else render_step(step, data)
+            keyboard = client.phone_keyboard() if step == "phone" else _wizard_keyboard(step, data, _display_name(sender))
+            await client.answer_callback(callback_id, text, keyboard=keyboard)
+            return
+
         if action == "set" and len(parts) >= 3:
             value = resolve_choice(step, parts[2], data, display_name=_display_name(sender))
             if value is None:
                 log.warning("MAX stale/unknown choice user_id=%s step=%s code=%s", user_id, step, parts[2])
                 return
+            await log_user_event(session, user, "wizard_answer", {"step": step, "value": value})
             result = consume(step, value, data)
         elif action == "back":
             result = go_back(step, data)
@@ -760,6 +823,7 @@ async def _handle_callback(client: MaxClient, notifier, update: dict[str, Any]) 
             result = type("R", (), {"reply": render_review(data), "next_step": "review", "data": data})()
         elif action == "edit":
             await save_conversation(session, conv, step="review", data=data)
+            await arm_wizard_reminder(session, conv)
             await session.commit()
             await client.answer_callback(
                 callback_id,
@@ -770,6 +834,9 @@ async def _handle_callback(client: MaxClient, notifier, update: dict[str, Any]) 
         elif action == "editstep" and len(parts) >= 3:
             result = edit_step(data, parts[2])
         elif action == "manual":
+            await save_conversation(session, conv, step=step, data=data)
+            await arm_wizard_reminder(session, conv)
+            await session.commit()
             await client.answer_callback(
                 callback_id,
                 render_step(step, data) + "\n\n✍️ <i>Напишите ответ обычным сообщением.</i>",
@@ -779,22 +846,42 @@ async def _handle_callback(client: MaxClient, notifier, update: dict[str, Any]) 
         elif action == "cancel":
             await reset_conversation(session, platform="max", platform_user_id=user_id)
             await session.commit()
-            subscribed, admin = await _menu_state(client.settings, user_id)
-            await client.answer_callback(callback_id, "Подбор тура отменён. Можно начать заново в любой момент.", keyboard=_main_menu_keyboard(subscribed=subscribed, is_admin=admin))
+            subscribed_now, admin = await _menu_state(client.settings, user_id)
+            await client.answer_callback(
+                callback_id, "Подбор тура отменён. Можно начать заново в любой момент.",
+                keyboard=_main_menu_keyboard(subscribed=subscribed_now, is_admin=admin),
+            )
             return
         elif action == "submit":
+            # Совместимость с незавершёнными review из предыдущей версии.
             await session.rollback()
             await _submit(client, notifier, user_id, chat_id, sender, callback_id)
             return
         else:
             return
 
-        await save_conversation(session, conv, step=result.next_step, data=result.data)
+        if result.next_step == "complete":
+            lead = await create_lead(session, user=user, data=result.data)
+            lead_id = lead.id
+            subscribed = bool(user.subscribed)
+            await reset_conversation(session, platform="max", platform_user_id=user_id)
+        else:
+            await save_conversation(session, conv, step=result.next_step, data=result.data)
+            await arm_wizard_reminder(session, conv)
         await session.commit()
+
+    if lead_id is not None:
+        log.info("MAX lead auto-submitted lead_id=%s user_id=%s", lead_id, user_id)
+        await client.answer_callback(
+            callback_id,
+            "✅ <b>Заявка отправлена!</b>\n\nМенеджер «Солнечных туров» свяжется с вами и предложит подходящие варианты.",
+            keyboard=_main_menu_keyboard(subscribed=subscribed, is_admin=_is_admin(client.settings, user_id)),
+        )
+        await notifier.notify_lead(lead_id)
+        return
 
     keyboard = client.phone_keyboard() if result.next_step == "phone" else _wizard_keyboard(result.next_step, result.data, _display_name(sender))
     await client.answer_callback(callback_id, result.reply, keyboard=keyboard)
-
 
 async def process_max_update(client: MaxClient, update: dict[str, Any], notifier) -> None:
     update_type = update.get("update_type") or update.get("type")
@@ -841,7 +928,7 @@ async def process_max_update(client: MaxClient, update: dict[str, Any], notifier
         valid = bool(vcf_info and received_hash and _verify_max_contact(client.settings.max_token, vcf_info, received_hash))
         log.info("MAX contact received user_id=%s verified=%s", user_id, valid)
         if valid and phone:
-            await _apply_value(client, user_id, chat_id, sender, phone)
+            await _apply_value(client, notifier, user_id, chat_id, sender, phone)
         else:
             log.warning("MAX contact verification failed user_id=%s", user_id)
             await client.send_to_user(user_id, "Не удалось проверить контакт. Введите номер телефона вручную, пожалуйста.")
@@ -911,7 +998,7 @@ async def process_max_update(client: MaxClient, update: dict[str, Any], notifier
         if conv.step == "review":
             await client.send_to_user(user_id, "Используйте кнопки под заявкой: отправить или изменить параметры.")
             return
-    await _apply_value(client, user_id, chat_id, sender, text)
+    await _apply_value(client, notifier, user_id, chat_id, sender, text)
 
 
 async def run_max_polling(client: MaxClient, notifier) -> None:

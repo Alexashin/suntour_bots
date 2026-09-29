@@ -87,6 +87,7 @@ async def main() -> None:
     tasks: list[asyncio.Task] = [
         asyncio.create_task(serve_api(api, settings.log_level), name="api"),
         asyncio.create_task(notifier.broadcast_worker(), name="broadcast-worker"),
+        asyncio.create_task(notifier.incomplete_wizard_worker(), name="wizard-reminder-worker"),
     ]
 
     if telegram_bot and settings.telegram_enable_polling:
